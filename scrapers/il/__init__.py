@@ -1,4 +1,6 @@
 # encoding=utf-8
+import os
+
 import requests
 from openstates.scrape import State
 from .bills import IlBillScraper
@@ -190,7 +192,7 @@ class Illinois(State):
     ]
 
     def get_session_list(self):
-        headers = {"User-Agent": "openstates.org"}
+        headers = {"User-Agent": os.getenv("USER_AGENT", "openstates.org")}
         response = requests.get(
             "https://ilga.gov/API/Legislation/GetGeneralAssemblies",
             headers=headers,
