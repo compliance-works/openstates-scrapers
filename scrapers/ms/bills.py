@@ -46,6 +46,14 @@ class MSBillScraper(Scraper):
     )
 
     def scrape(self, chamber=None, session=None):
+        self.house_speaker = next(
+            (
+                s.get("extras", {}).get("house_speaker")
+                for s in self.jurisdiction.legislative_sessions
+                if s["identifier"] == session
+            ),
+            None,
+        )
         chambers = [chamber] if chamber else ["upper", "lower"]
         for chamber in chambers:
             yield from self.scrape_bills(chamber, session)
@@ -108,13 +116,15 @@ class MSBillScraper(Scraper):
             bill.extras["summary"] = longtitle
             bill.add_source(main_doc_url)
             # sponsors
-            main_sponsor = details_root.xpath("string(//P_NAME)").split()
+            # "*" sometimes trails the name; it isn't part of it
+            main_sponsor = " ".join(
+                details_root.xpath("string(//P_NAME)").replace("*", "").split()
+            )
             if main_sponsor:
-                main_sponsor = main_sponsor[0]
                 main_sponsor_link = details_root.xpath("string(//P_LINK)").replace(
                     " ", "_"
                 )
-                main_sponsor_url = ("http://billstatus.ls.state.ms.us/%s/" "pdf/%s") % (
+                main_sponsor_url = ("http://billstatus.ls.state.ms.us/%s/pdf/%s") % (
                     session,
                     main_sponsor_link.strip("../"),
                 )
@@ -131,8 +141,7 @@ class MSBillScraper(Scraper):
                 leg = author.xpath("string(CO_NAME)").replace(" ", "_")
                 if leg:
                     leg_url = (
-                        "http://billstatus.ls.state.ms.us/%s/"
-                        "pdf/House_authors/%s.xml"
+                        "http://billstatus.ls.state.ms.us/%s/pdf/House_authors/%s.xml"
                     ) % (session, leg)
                     type = "cosponsor"
                     bill.add_source(leg_url)
@@ -143,7 +152,7 @@ class MSBillScraper(Scraper):
                         primary=False,
                     )
             # Versions
-            curr_version = details_root.xpath("string(//CURRENT_OTHER" ")").replace(
+            curr_version = details_root.xpath("string(//CURRENT_OTHER)").replace(
                 "../../../../", ""
             )
             if curr_version != "":
@@ -181,7 +190,7 @@ class MSBillScraper(Scraper):
                     media_type="application/pdf",
                 )
 
-            comm_version = details_root.xpath("string(//CMTESUB_OTHER" ")").replace(
+            comm_version = details_root.xpath("string(//CMTESUB_OTHER)").replace(
                 "../../../../", ""
             )
             if comm_version.find("documents") != -1:
@@ -200,7 +209,7 @@ class MSBillScraper(Scraper):
                     media_type="application/pdf",
                 )
 
-            passed_version = details_root.xpath("string(//PASSED_OTHER" ")").replace(
+            passed_version = details_root.xpath("string(//PASSED_OTHER)").replace(
                 "../../../../", ""
             )
             if passed_version.find("documents") != -1:
@@ -249,22 +258,22 @@ class MSBillScraper(Scraper):
                     name = append_parens(amd, "HAM_DISP", name)
                     name = append_parens(amd, "HAM_VDESC", name)
 
-                    pdf_url = amd.xpath("string(HAM_PDF" ")").replace("../", "")
+                    pdf_url = amd.xpath("string(HAM_PDF)").replace("../", "")
 
-                    html_url = amd.xpath("string(HAM_OTHER" ")").replace("../", "")
+                    html_url = amd.xpath("string(HAM_OTHER)").replace("../", "")
                 elif amd.tag == "SAM":
                     name = amd.xpath("SAM_DESC[1]/text()")[0]
                     name = append_parens(amd, "SAM_DISP", name)
                     name = append_parens(amd, "SAM_VDESC", name)
 
-                    pdf_url = amd.xpath("string(SAM_PDF" ")").replace("../", "")
+                    pdf_url = amd.xpath("string(SAM_PDF)").replace("../", "")
 
-                    html_url = amd.xpath("string(SAM_OTHER" ")").replace("../", "")
+                    html_url = amd.xpath("string(SAM_OTHER)").replace("../", "")
                 elif amd.tag == "AMRPT":
                     name = amd.xpath("AMRPT_DESC[1]/text()")[0]
-                    pdf_url = amd.xpath("string(AMRPT_PDF" ")").replace("../", "")
+                    pdf_url = amd.xpath("string(AMRPT_PDF)").replace("../", "")
 
-                    html_url = amd.xpath("string(AMRPT_OTHER" ")").replace("../", "")
+                    html_url = amd.xpath("string(AMRPT_OTHER)").replace("../", "")
 
                 pdf_url = "http://billstatus.ls.state.ms.us/" + pdf_url
                 html_url = "http://billstatus.ls.state.ms.us/" + html_url
@@ -273,11 +282,16 @@ class MSBillScraper(Scraper):
                     bill.add_version_link(
                         name,
                         pdf_url,
+                        classification="amendment",
                         on_duplicate="ignore",
                         media_type="application/pdf",
                     )
                     bill.add_version_link(
-                        name, html_url, on_duplicate="ignore", media_type="text/html"
+                        name,
+                        html_url,
+                        classification="amendment",
+                        on_duplicate="ignore",
+                        media_type="text/html",
                     )
 
             # avoid duplicate votes
@@ -368,7 +382,7 @@ class MSBillScraper(Scraper):
         "Decline to Concur/Invite Conf": ("Decline to Concur", True),
         "Decline Concur/Inv Conf Lost": ("Decline to Concur", False),
         "Failed to Suspend Rules": ("Motion to Suspend Rules", False),
-        "Motion to Recommit Lost": ("Motion to Recommit", True),
+        "Motion to Recommit Lost": ("Motion to Recommit", False),
         "Reconsidered": ("Reconsideration", True),
         "Motion to Concur Failed": ("Motion to Concur", False),
         "Recommitted to Committee": ("Recommit to Committee", True),
@@ -410,6 +424,9 @@ class MSBillScraper(Scraper):
         lines = _combine_lines(text.decode().split("\n"))
 
         for line in lines:
+            # House rolls list the presiding officer as "Mr. Speaker"
+            if self.house_speaker:
+                line = line.replace("Mr. Speaker", self.house_speaker)
 
             # check if the line starts with a precursor, switch to that array
             for pc, arr in precursors:

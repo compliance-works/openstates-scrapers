@@ -307,6 +307,18 @@ class Arizona(State):
             "extras": {
                 "session_id": 130,
             },
+            "active": False,
+        },
+        {
+            "_scraped_name": "2027 - Fifty-eighth Legislature - First Regular Session",
+            "classification": "primary",
+            "identifier": "58th-1st-regular",
+            "name": "58th Legislature - First Regular Session",
+            "start_date": "2027-01-11",
+            "end_date": "2027-05-27",
+            "extras": {
+                "session_id": 131,
+            },
             "active": True,
         },
     ]

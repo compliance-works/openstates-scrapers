@@ -1,7 +1,9 @@
 import re
 import datetime
+import lxml.etree
 import lxml.html
 import pytz
+import requests
 from collections import defaultdict
 
 from openstates.scrape import Scraper, Bill, VoteEvent
@@ -64,7 +66,7 @@ class NYBillScraper(Scraper):
             self.logger.warning(warning).format(bill_id)
 
         senate_url = (
-            "http://www.nysenate.gov/legislation/bills/{bill_session}/" "{bill_id}"
+            "http://www.nysenate.gov/legislation/bills/{bill_session}/{bill_id}"
         ).format(bill_session=bill["session"], bill_id=bill_id)
 
         # assembly_url = (
@@ -411,7 +413,20 @@ class NYBillScraper(Scraper):
         for vote_data in bill_data["votes"]["items"]:
             yield self._parse_senate_votes(vote_data, bill, api_url)
 
-        yield from self.scrape_assembly_votes(session, bill, assembly_url, bill_id)
+        # catches votes cast after the index was built
+        assembly_rollcall = any(
+            action["chamber"] == "ASSEMBLY"
+            and action["text"].startswith(
+                ("PASSED ASSEMBLY", "DEFEATED IN ASSEMBLY", "MOTION TO DISCHARGE")
+            )
+            for action in bill_data["actions"]["items"]
+        )
+        if (
+            self.assembly_voted is None
+            or bill_id in self.assembly_voted
+            or assembly_rollcall
+        ):
+            yield from self.scrape_assembly_votes(session, bill, assembly_url, bill_id)
 
         # A little strange the way it works out, but the Assembly
         # provides the HTML version documents and the Senate provides
@@ -475,6 +490,44 @@ class NYBillScraper(Scraper):
 
         yield bill
 
+    def _assembly_floor_voted_bills(self):
+        # Assembly advanced search can list the bills voted on each floor
+        # vote date. Returns None (fetch every bill's vote page) on any doubt.
+        url = "https://nyassembly.gov/leg/?sh=advanced"
+        form = dict(term=self.term_start_year, leg_type="A", house="", by="a")
+        voted = set()
+        try:
+            doc = lxml.html.fromstring(
+                self.post(url, data={**form, "evt_fld": "Term"}, verify=False).content
+            )
+            dates = doc.xpath('//select[@name="floor_vote"]/option/@value')
+            dates = [d for d in dates if d]
+            if not dates:
+                self.warning("No Assembly floor vote dates found")
+                return None
+            for date in dates:
+                doc = lxml.html.fromstring(
+                    self.post(
+                        url,
+                        data={**form, "floor_vote": date, "evt_fld": "Search"},
+                        verify=False,
+                    ).content
+                )
+                count = doc.xpath('string(//div[@id="bill_count_div"]/span)')
+                bills = doc.xpath('//div[@id="vcontent_div"]//li/a/text()')
+                if count != str(len(bills)):
+                    self.warning(
+                        f"Assembly floor votes {date}: {count} != {len(bills)}"
+                    )
+                    return None
+                # A00112 -> A112, to match basePrintNo
+                voted.update(re.sub(r"^([A-Z])0+", r"\1", b.strip()) for b in bills)
+        except (requests.exceptions.RequestException, lxml.etree.ParserError) as e:
+            self.warning(f"Assembly floor vote index failed: {e}")
+            return None
+        self.info(f"{len(voted)} bills have Assembly floor votes on {len(dates)} dates")
+        return voted
+
     def scrape_assembly_votes(self, session, bill, assembly_url, bill_id):
         # parse the bill data page, finding the latest html text
         # default_fld=/leg_video= removes bill summary table from content
@@ -491,7 +544,6 @@ class NYBillScraper(Scraper):
             vote_motions = []
             additional_votes_on_motion = 2
             for table in doc.xpath("//table"):
-
                 date = table.xpath('caption/span[contains(., "DATE:")]')
                 if not date or len(date) == 0:
                     continue
@@ -560,6 +612,8 @@ class NYBillScraper(Scraper):
 
                 for vote_pair in votes:
                     vote_val, name = vote_pair
+                    if name == "Mr. Speaker":
+                        name = self.speaker or name
                     vote.vote(vote_dictionary[vote_val], name)
                     if vote_val == "AB":
                         absent_count += 1
@@ -602,6 +656,20 @@ class NYBillScraper(Scraper):
     def scrape(self, session=None, bill_no=None, window=None):
         self.api_client = OpenLegislationAPIClient(self)
         self.term_start_year = session.split("-")[0]
+        # Assembly floor rolls list the Speaker as "Mr. Speaker"
+        self.speaker = next(
+            s.get("extras", {}).get("assembly_speaker")
+            for s in self.jurisdiction.legislative_sessions
+            if s["identifier"] == session
+        )
+        if not self.speaker:
+            self.warning(
+                f"No assembly_speaker in {session} session extras; "
+                "Assembly roll calls will list the title"
+            )
+        self.assembly_voted = (
+            None if bill_no or window else self._assembly_floor_voted_bills()
+        )
 
         for bill in self._generate_bills(session, window):
             if bill_no:

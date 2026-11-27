@@ -1,8 +1,8 @@
 from .bills import SCBillScraper
 from .events import SCEventScraper
 from openstates.scrape import State
-import requests
 import lxml.html
+import scrapelib
 
 settings = {"SCRAPELIB_RPM": 30}
 
@@ -77,8 +77,17 @@ class SouthCarolina(State):
             "identifier": "2025-2026",
             "name": "2025-2026 Regular Session",
             "start_date": "2025-01-14",
-            "end_date": "2025-05-08",
+            "end_date": "2026-11-08",
             "active": True,
+        },
+        {
+            "_scraped_name": "127 - (2027-2028)",
+            "classification": "primary",
+            "identifier": "2027-2028",
+            "name": "2027-2028 Regular Session",
+            "start_date": "2027-01-12",
+            "end_date": "2027-05-13",
+            "active": False,
         },
     ]
     ignored_scraped_sessions = [
@@ -106,5 +115,5 @@ class SouthCarolina(State):
         """Get session list from billsearch page using xpath"""
         url = "https://www.scstatehouse.gov/billsearch.php"
         path = "//select[@id='session']/option/text()"
-        doc = lxml.html.fromstring(requests.get(url).text)
+        doc = lxml.html.fromstring(scrapelib.Scraper().get(url, timeout=30).text)
         return doc.xpath(path)

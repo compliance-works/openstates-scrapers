@@ -189,6 +189,7 @@ class Oklahoma(State):
             "start_date": "2025-02-03",
             "end_date": "2025-05-30",
             "active": False,
+            "extras": {"house_speaker": "Hilbert"},
         },
         {
             "_scraped_name": "2026 Regular Session",
@@ -196,16 +197,17 @@ class Oklahoma(State):
             "name": "2026 Regular Session",
             "start_date": "2026-02-02",
             "end_date": "2026-05-29",
-            "active": True,
+            "active": False,
+            "extras": {"house_speaker": "Hilbert"},
         },
         {
             "_scraped_name": "2027 Regular Session",
             "identifier": "2027",
             "name": "2027 Regular Session",
             # TODO real dates
-            "start_date": "2027-02-02",
-            "end_date": "2027-05-29",
-            "active": False,
+            "start_date": "2027-02-01",
+            "end_date": "2027-05-28",
+            "active": True,
         },
     ]
     ignored_scraped_sessions = [

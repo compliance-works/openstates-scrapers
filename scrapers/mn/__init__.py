@@ -2,7 +2,6 @@ from utils import url_xpath
 from openstates.scrape import State
 
 from .bills import MNBillScraper
-from .vote_events import MNVoteScraper
 from .events import MNEventScraper
 
 """
@@ -20,7 +19,6 @@ sense to get vote data from the bill pages.
 class Minnesota(State):
     scrapers = {
         "bills": MNBillScraper,
-        "votes": MNVoteScraper,
         "events": MNEventScraper,
     }
     legislative_sessions = [
@@ -272,7 +270,7 @@ class Minnesota(State):
 
     def get_session_list(self):
         return url_xpath(
-            "https://www.revisor.mn.gov/bills/" "status_search.php?body=House",
+            "https://www.revisor.mn.gov/bills/status_search.php?body=House",
             '//select[@name="session"]/option/text()',
             False,  # SSL verification failing in MN due to missing intermediate cert
         )

@@ -21,7 +21,7 @@ class MPBillScraper(Scraper):
         "Senate Legislative initiatives:": "SLI",
         "Senate Joint Resolutions:": "SJR",
         "Senate Local Bills:": "SLB",
-        "Senate Commemorative Resolutions:": "SR",
+        "Senate Commemorative Resolutions:": "SCommRes",
     }
 
     bill_type_map = {
@@ -36,9 +36,8 @@ class MPBillScraper(Scraper):
         "HCR": "concurrent resolution",
         "HLI": "bill",
         "SLI": "bill",
-        "HLB": "bill",
-        "SLB": "bill",
         "HCommRes": "resolution",
+        "SCommRes": "resolution",
     }
 
     def scrape(self, chamber=None, session=None):
@@ -151,9 +150,7 @@ class MPBillScraper(Scraper):
                 page, "Senate Committee"
             ) == last_action or self.get_cell_text(
                 page, "Senate Committee"
-            ) == last_action.replace(
-                "SENATE-", ""
-            ):
+            ) == last_action.replace("SENATE-", ""):
                 bill.add_action(
                     last_action,
                     dateutil.parser.parse(last_updated).strftime("%Y-%m-%d"),
@@ -166,9 +163,7 @@ class MPBillScraper(Scraper):
                 page, "House Committee"
             ) == last_action or self.get_cell_text(
                 page, "House Committee"
-            ) == last_action.replace(
-                "HOUSE-", ""
-            ):
+            ) == last_action.replace("HOUSE-", ""):
                 bill.add_action(
                     last_action,
                     dateutil.parser.parse(last_updated).strftime("%Y-%m-%d"),

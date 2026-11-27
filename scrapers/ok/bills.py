@@ -4,7 +4,6 @@ import collections
 import unicodedata
 
 from lxml import html
-import requests
 import scrapelib
 
 from urllib import parse
@@ -18,7 +17,7 @@ from .actions import Categorizer
 NAME_RE = re.compile(r"Mr\.\s+Speaker|[A-Za-z][\w'\-]*(?:\s+\([^)]+\))?")
 
 
-def extract_names(line, limit):
+def extract_names(line, limit, speaker=None):
     """Extract up to `limit` legislator names from a vote-roll line.
 
     Names are rendered with single spaces between them (Word's
@@ -37,12 +36,13 @@ def extract_names(line, limit):
         name = match.group(0).strip()
         if not name or "HOUSE" in name or "SENATE" in name:
             continue
+        if speaker and name.startswith("Mr."):
+            name = speaker
         names.append(name)
     return names
 
 
 class OKBillScraper(Scraper):
-    verify = False
     bill_types = ["B", "JR", "CR", "R"]
     subject_map = collections.defaultdict(list)
 
@@ -79,6 +79,16 @@ class OKBillScraper(Scraper):
     }
 
     def scrape(self, chamber=None, session=None, only_bills=None):
+        extras = next(
+            s.get("extras", {})
+            for s in self.jurisdiction.legislative_sessions
+            if s["identifier"] == session
+        )
+        self.speaker = extras.get("house_speaker")
+        if not self.speaker:
+            self.warning(
+                f"No house_speaker in {session} extras; roll calls will list the title"
+            )
         chambers = [chamber] if chamber else ["upper", "lower"]
         for chamber in chambers:
             yield from self.scrape_chamber(chamber, session, only_bills)
@@ -88,9 +98,7 @@ class OKBillScraper(Scraper):
         self.scrape_subjects(chamber, session)
 
         url = "https://webapps.oklegislature.gov/WebApplication3/WebForm1.aspx"
-        requests_session = requests.Session()
-        requests_session.verify = False
-        form_page = html.fromstring(requests_session.get(url).text)
+        form_page = html.fromstring(self.get(url, verify=False).text)
 
         if chamber == "upper":
             chamber_letter = "S"
@@ -114,11 +122,15 @@ class OKBillScraper(Scraper):
         for hidden in form_page.xpath("//input[@type='hidden']"):
             values[hidden.attrib["name"]] = hidden.attrib["value"]
 
+        # bill pages on www.oklegislature.gov set their own ASP.NET_SessionId
+        session_cookie = self.cookies.get(
+            "ASP.NET_SessionId", domain="webapps.oklegislature.gov"
+        )
         headers = {
-            "Cookie": f"ASP.NET_SessionId={requests_session.cookies.get('ASP.NET_SessionId')}",
+            "Cookie": f"ASP.NET_SessionId={session_cookie}",
             "x-oxylabs-force-headers": "1",
         }
-        response = requests_session.post(url, data=values, headers=headers)
+        response = self.post(url, data=values, headers=headers, verify=False)
         page = response.text
         page = html.fromstring(page)
         page.make_links_absolute(url)
@@ -219,18 +231,16 @@ class OKBillScraper(Scraper):
                 actor = "upper"
 
             attrs = self.categorizer.categorize(action)
-            related_entities = []
-            for item in attrs["committees"]:
-                related_entities.append({"type": "committee", "name": item})
-            for item in attrs["legislators"]:
-                related_entities.append({"type": "legislator", "name": item})
-            bill.add_action(
+            act = bill.add_action(
                 description=action,
                 date=date.strftime("%Y-%m-%d"),
                 chamber=actor,
                 classification=attrs["classification"],
-                related_entities=related_entities,
             )
+            for item in sorted(attrs["committees"]):
+                act.add_related_entity(item, "organization")
+            for item in sorted(attrs["legislators"]):
+                act.add_related_entity(item, "person")
 
         version_table = page.xpath("//table[contains(@id, 'Versions')]")[0]
         # Keep track of already seen versions to prevent processing duplicates.
@@ -285,8 +295,21 @@ class OKBillScraper(Scraper):
         for link in page.xpath(amd_xpath):
             version_url = link.xpath("@href")[0]
             version_name = link.xpath("string(.)").strip()
+            # committee/floor substitutes (PCS, FS) and committee recommendations
+            # (POLREC, SUBREC) are full bill text; FULLPCS/POLPCS/...AMD are amendments
+            codes = set(
+                re.findall(r"\b([A-Z]+)\d*\b", parse.unquote(version_url).upper())
+            )
+            is_full_text = (
+                "FS" in codes
+                or "PCS" in codes
+                or ({"POLREC", "SUBREC"} & codes and "AMD" not in codes)
+            )
             bill.add_version_link(
-                version_name, version_url, media_type="application/pdf"
+                version_name,
+                version_url,
+                classification="" if is_full_text else "amendment",
+                media_type="application/pdf",
             )
 
     def scrape_votes(self, bill, url):
@@ -450,6 +473,13 @@ class OKBillScraper(Scraper):
                 line = sib.xpath("string()").strip()
                 if "*****" in line or "motion by" in line:
                     break
+                # House headers state the result above the tally, e.g.
+                # "FAILED" / "EMERGENCY" when a two-thirds vote falls short.
+                if not seen_yes and passed is None:
+                    if re.search(r"\bFAILED\b", line):
+                        passed = False
+                    elif re.search(r"\bPASSED\b", line):
+                        passed = True
                 regex = (
                     r"(YEAS|AYES|NAYS|EXCUSED|VACANT|VACANCY|CONSTITUTIONAL "
                     r"PRIVILEGE|NOT VOTING|N/V)\s*:\s*(\d+)(.*)"
@@ -476,7 +506,9 @@ class OKBillScraper(Scraper):
                 elif seen_yes:
                     remaining = counts[vtype] - len(votes[vtype])
                     if remaining > 0:
-                        votes[vtype].extend(extract_names(line, remaining))
+                        votes[vtype].extend(
+                            extract_names(line, remaining, self.speaker)
+                        )
 
             if bad_vote:
                 continue

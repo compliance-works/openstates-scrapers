@@ -5,8 +5,9 @@ import collections
 import lxml.etree
 
 from openstates.utils import convert_pdf
-from openstates.scrape import Scraper, VoteEvent
+from openstates.scrape import VoteEvent
 from openstates.exceptions import EmptyScrape
+from .utils import IAScraper
 
 # https://www.legis.iowa.gov/legislation/findLegislation/allbills?ga=91
 SITE_IDS = {
@@ -21,7 +22,20 @@ SITE_IDS = {
 }
 
 
-class IAVoteScraper(Scraper):
+def classify_motion(motion):
+    motion = motion.lower()
+    if "rules be suspended" in motion:
+        return []
+    if "notwithstanding" in motion:
+        return ["veto-override"]
+    if "amendment" in motion or "concur" in motion:
+        return ["amendment"]
+    if "pass?" in motion or "resolution be adopted" in motion:
+        return ["passage"]
+    return []
+
+
+class IAVoteScraper(IAScraper):
     def scrape(self, chamber=None, session=None):
         event_count = 0
         if chamber:
@@ -103,22 +117,25 @@ class IAVoteScraper(Scraper):
         # Do not process headers or completely empty lines
         header_date_re = re.compile(r"\d+\w{2} Day\s+\w+DAY, \w+ \d{1,2}, \d{4}\s+\d+")
         header_journal_re = re.compile(r"\d+\s+JOURNAL OF THE \w+\s+\d+\w{2} Day")
-        lines = iter(
-            [
-                line
-                for line in lines
-                if not (
-                    line == ""
-                    or header_date_re.match(line)
-                    or header_journal_re.match(line)
-                )
-            ]
-        )
+        bill_re = re.compile(r"\(\s*([A-Z\.]+\s\d+)\s*\)")
+        merged = []
+        for line in lines:
+            if (
+                line == ""
+                or header_date_re.match(line)
+                or header_journal_re.match(line)
+            ):
+                continue
+            # A long House motion can push its "(H.F. 123)" onto the next line
+            if merged and bill_re.fullmatch(line):
+                merged[-1] += " " + line
+            else:
+                merged.append(line)
+        lines = iter(merged)
 
         # bill_id -> motion -> count
         motions_per_bill = collections.defaultdict(collections.Counter)
 
-        bill_re = re.compile(r"\(\s*([A-Z\.]+\s\d+)\s*\)")
         chamber_motion_re = {
             "upper": re.compile(r".* the vote was:\s*"),
             "lower": re.compile(r'.*Shall.*(?:\?"?|")(\s{bill_re.pattern})?\s*'),
@@ -163,7 +180,6 @@ class IAVoteScraper(Scraper):
                 motion = motion.group(1)
 
             for word, letter in (("Senate", "S"), ("House", "H"), ("File", "F")):
-
                 if bill_id is None:
                     return
 
@@ -206,7 +222,7 @@ class IAVoteScraper(Scraper):
                 start_date=date,
                 motion_text=motion_text,
                 result=result,
-                classification="passage",
+                classification=classify_motion(motion_text),
                 legislative_session=session,
                 bill=bill_id,
                 bill_chamber=bill_chamber,
@@ -240,6 +256,7 @@ class IAVoteScraper(Scraper):
             ("The yeas were", "yes"),
             ("The nays were", "no"),
             ("Absent or not voting", "absent"),
+            ("Rule 76 invoked", "abstain"),
             ("The bill", DONE),
             ("The committee", DONE),
             ("The resolution", DONE),
@@ -255,7 +272,8 @@ class IAVoteScraper(Scraper):
                 if text.strip().startswith(blurb):
                     return key
 
-        vote_re = re.compile(r"\d+")
+        # last number on the line ("Rule 76 invoked, 1:" -> 1)
+        vote_re = re.compile(r"\d+(?=\D*$)")
         """
         First step:
         move to the first line that has a "boundary" string
@@ -290,7 +308,7 @@ class IAVoteScraper(Scraper):
                 passed = False
                 # This text can appear in a line
                 # "Amendment H–1011 lost. Harris of Appanoose moved that House Resolution 3 be adopted".
-                if not ("lost" in passage_line) and any(
+                if "lost" not in passage_line and any(
                     p in passage_line for p in passage_strings
                 ):
                     passed = True
@@ -326,29 +344,13 @@ class IAVoteScraper(Scraper):
         return counts, passed
 
     def split_names(self, text):
-        junk = ["Presiding", "Mr. Speaker", "Spkr.", "."]
-        text = text.strip()
-        chunks = text.split()[::-1]
-        name = [chunks.pop()]
+        # Journal rolls are laid out in columns, so names are separated by 2+
+        # spaces, while multi-word names ("Kniff McCulla", "De Witt",
+        # "Amos Jr.") only contain single spaces.
+        junk = ["Presiding", "Mr. Speaker", "Speaker", "Spkr.", "."]
         names = []
-        while chunks:
-            chunk = chunks.pop()
-            if len(chunk) < 3:
-                name.append(chunk)
-            elif name[-1] in ("Mr.", "Van", "De", "Vander"):
-                name.append(chunk)
-            else:
-                name = " ".join(name).strip(",")
-                if name and (name not in names) and (name not in junk):
-                    names.append(name)
-
-                # Seed the next loop.
-                name = [chunk]
-
-        # Similar changes to the final name in the sequence.
-        name = " ".join(name).strip(",")
-        if names and len(name) < 3:
-            names[-1] += f" {name}"
-        elif name and (name not in names) and (name not in junk):
-            names.append(name)
+        for name in re.split(r"\s{2,}", text.strip()):
+            name = re.sub(r",?\s*(Spkr\.|Presiding)$", "", name).strip(" ,")
+            if name and (name not in names) and (name not in junk):
+                names.append(name)
         return names

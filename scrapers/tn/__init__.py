@@ -144,7 +144,7 @@ class Tennessee(State):
             "name": "114th Regular Session (2025-2026)",
             "start_date": "2025-01-14",
             "end_date": "2026-04-25",
-            "active": True,
+            "active": False,
         },
         {
             "_scraped_name": "First Extraordinary Session (January 2025)",
@@ -153,7 +153,7 @@ class Tennessee(State):
             "name": "114th First Extraordinary Session (January 2025)",
             "start_date": "2025-01-27",
             "end_date": "2025-01-31",
-            "active": True,
+            "active": False,
         },
         {
             "_scraped_name": "Second Extraordinary Session (May 2026)",
@@ -163,6 +163,15 @@ class Tennessee(State):
             "start_date": "2026-05-05",
             "end_date": "2026-05-08",
             "active": False,
+        },
+        {
+            "_scraped_name": "115th General Assembly",
+            "classification": "primary",
+            "identifier": "115",
+            "name": "115th Regular Session (2027-2028)",
+            "start_date": "2027-01-12",
+            "end_date": "2027-04-25",
+            "active": True,
         },
     ]
     ignored_scraped_sessions = [

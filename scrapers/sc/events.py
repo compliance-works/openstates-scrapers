@@ -124,7 +124,7 @@ class SCEventScraper(Scraper):
 
     def scrape(self, chamber=None, session=None):
         if chamber:
-            yield from self.scrape(chamber, session)
+            yield from self.scrape_single_chamber(chamber, session)
         else:
             yield from self.scrape_single_chamber("legislature", session)
             yield from self.scrape_single_chamber("upper", session)
@@ -151,8 +151,9 @@ class SCEventScraper(Scraper):
             self.info("no chamber specified, using Joint Committee Meeting Schedule")
             events_url = "https://www.scstatehouse.gov/meetings.php"
         else:
-            events_url = "https://www.scstatehouse.gov/meetings.php?chamber=%s" % (
-                chambers[chamber].upper()[0]
+            events_url = (
+                "https://www.scstatehouse.gov/meetings.php?chamber=%s"
+                % (chambers[chamber].upper()[0])
             )
         page = self.get_page_from_url(events_url)
 
@@ -281,7 +282,9 @@ class SCEventScraper(Scraper):
                     )
 
                     if ".pdf" in agenda_url:
-                        for bill_id in Agenda(source=URL(agenda_url)).do_scrape():
+                        for bill_id in Agenda(source=URL(agenda_url)).do_scrape(
+                            scraper=self
+                        ):
                             event.add_bill(bill_id)
                     else:
                         agenda_page = self.get_page_from_url(agenda_url)

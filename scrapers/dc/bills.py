@@ -98,13 +98,14 @@ class DCBillScraper(Scraper):
                         is_version = False
                         # figure out if it's a version from type/name
                         possible_version_types = [
-                            "SignedAct",
+                            "Signed Act",
                             "Introduction",
                             "Enrollment",
                             "Engrossment",
                         ]
                         for vt in possible_version_types:
-                            if vt.lower() in download.lower():
+                            # URLs spell it "/Signed_Act/"
+                            if vt.replace(" ", "_").lower() in download.lower():
                                 is_version = True
                                 doc_type = vt
 
@@ -154,16 +155,22 @@ class DCBillScraper(Scraper):
                             primary=True,
                         )
 
-                    # Co-sponsor
-                    if leg_details["coSponsors"]:
-                        for cs in leg_details["coSponsors"]:
-                            name = i["memberName"]
-                            bill.add_sponsorship(
-                                name,
-                                classification="cosponsor",
-                                entity_type="person",
-                                primary=True,
-                            )
+                    # Co-sponsors - the LIMS API tracks two distinct groups as
+                    # cosponsors on the bill's page ("Co-Introduced by" and
+                    # "Co-Sponsored by"): "coIntroducers" (added at introduction)
+                    # and "coSponsors" (added after introduction). The scraper
+                    # previously only read "coSponsors", which is empty for most
+                    # bills, so co-introducers (the common case) were dropped.
+                    for cs in (leg_details.get("coIntroducers") or []) + (
+                        leg_details.get("coSponsors") or []
+                    ):
+                        name = cs["memberName"]
+                        bill.add_sponsorship(
+                            name,
+                            classification="cosponsor",
+                            entity_type="person",
+                            primary=False,
+                        )
 
                     # Committee Hearing Doc
                     for commHearing in leg_details["committeeHearing"]:
@@ -211,15 +218,19 @@ class DCBillScraper(Scraper):
                                     else get_media_type(act["attachment"])
                                 )
                                 is_version = False
+                                doc_type = action_name
                                 # figure out if it's a version from type/name
                                 possible_version_types = [
-                                    "SignedAct",
+                                    "Signed Act",
                                     "Introduction",
                                     "Enrollment",
                                     "Engrossment",
                                 ]
                                 for vt in possible_version_types:
-                                    if vt.lower() in act["attachment"].lower():
+                                    if (
+                                        vt.replace(" ", "_").lower()
+                                        in act["attachment"].lower()
+                                    ):
                                         is_version = True
                                         doc_type = vt
 
@@ -270,11 +281,9 @@ class DCBillScraper(Scraper):
                                         )
                                         v.add_source(leg_listing_url)
 
-                                        yes_count = (
-                                            no_count
-                                        ) = (
-                                            absent_count
-                                        ) = abstain_count = other_count = 0
+                                        yes_count = no_count = absent_count = (
+                                            abstain_count
+                                        ) = other_count = 0
                                         for leg_vote in act["voteDetails"]["votes"]:
                                             mem_name = leg_vote["councilMember"]
                                             if leg_vote["vote"] == "Yes":

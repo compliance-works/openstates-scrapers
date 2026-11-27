@@ -39,8 +39,8 @@ class Rule(namedtuple("Rule", "regexes types stop attrs")):
         for regex in regexes:
             if isinstance(regex, str):
                 if flexible_whitespace:
-                    c_regex = re.sub(r"\s{1,4}", r"\\s{,10}", regex)
-                compiled_regexes.append(re.compile(c_regex, flags))
+                    regex = re.sub(r"\s{1,4}", r"\\s{,10}", regex)
+                compiled_regexes.append(re.compile(regex, flags))
             else:
                 compiled_regexes.append(regex)
 
@@ -90,7 +90,6 @@ class BaseCategorizer(object):
         return_val = defaultdict(set)
 
         for rule in self.rules:
-
             attrs = rule.match(text)
 
             # matched if attrs is not None - empty attr dict means a match
@@ -110,7 +109,7 @@ class BaseCategorizer(object):
                     break
 
         # set type
-        return_val["classification"] = list(types)
+        return_val["classification"] = sorted(types)
 
         # run post-categorize hook
         return_val = self.post_categorize(return_val)
@@ -127,17 +126,15 @@ class BaseCategorizer(object):
 
         # Get rid of defaultdict.
         for k, v in attrs.items():
-
             # Skip empties.
             if not isinstance(v, Iterable):
                 continue
 
-            if not isinstance(v, str):
-                v = list(filter(None, v))
-
             # Get rid of sets.
             if isinstance(v, set):
-                v = list(v)
+                v = sorted(filter(None, v))
+            elif not isinstance(v, str):
+                v = list(filter(None, v))
 
             # Some vals should be strings, not seqs.
             if k == "actor" and len(v) == 1:

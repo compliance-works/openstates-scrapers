@@ -3,7 +3,6 @@ from dateutil.parser import ParserError
 import datetime
 import pytz
 import re
-import requests
 import lxml.html
 from openstates.scrape import Scraper, Event
 from utils import LXMLMixin
@@ -22,7 +21,6 @@ class UnknownBillIdPrefixError(BaseException):
 
 
 class NCEventScraper(Scraper, LXMLMixin):
-    verify = False
     _tz = pytz.timezone("US/Eastern")
     bill_id_re = re.compile(r"([A-Z]\w+\s)*([A-Z]\w+\s)([A-Z]\w+\s)(\d+)")
 
@@ -32,24 +30,28 @@ class NCEventScraper(Scraper, LXMLMixin):
         page.make_links_absolute(url)
         event_count = 0
         for day_row in page.xpath('//div[@class="row cal-event-day"]'):
-
             date = day_row.xpath(
                 './/div[contains(@class, "cal-event-day-full")]/text()'
             )[0].strip()
             for row in day_row.xpath('.//div[contains(@class, "cal-event row")]'):
                 status = "tentative"
-                # first cal-event-row sometimes contains full date, skip that
-                time = (
-                    row.xpath(
-                        'div[contains(@class,"col-12 text-left col-sm-3 text-sm-right")]'
-                    )[0]
-                    .text_content()
-                    .strip()
+                # first cal-event-row sometimes contains full date, and other
+                # rows can omit the time column entirely; skip any row that
+                # doesn't have the expected time cell instead of crashing on [0]
+                time_cell = row.xpath(
+                    'div[contains(@class,"col-12 text-left col-sm-3 text-sm-right")]'
                 )
+                if not time_cell:
+                    continue
+                time = time_cell[0].text_content().strip()
 
-                event_row = row.xpath(
+                # similarly, skip rows missing the main event column
+                event_rows = row.xpath(
                     'div[contains(@class,"col-12 col-sm-9 col-md-12 ")]'
-                )[0]
+                )
+                if not event_rows:
+                    continue
+                event_row = event_rows[0]
 
                 # skip floor sessions
                 if event_row.xpath('.//a[contains(text(), "Session Convenes")]'):
@@ -73,11 +75,8 @@ class NCEventScraper(Scraper, LXMLMixin):
                 com_name = f"{chamber} {com_name}".strip()
                 com_url = com_link.xpath("@href")[0]
 
-                where = (
-                    row.xpath('div[contains(@class,"col-12 offset-sm-3")]')[0]
-                    .text_content()
-                    .strip()
-                )
+                where_cell = row.xpath('div[contains(@class,"col-12 offset-sm-3")]')
+                where = where_cell[0].text_content().strip() if where_cell else ""
                 where = where.replace("STREAM", "").replace("Stream", "")
                 where = where.replace("Ended", "").strip()
 
@@ -129,7 +128,7 @@ class NCEventScraper(Scraper, LXMLMixin):
                             #  but proper prefixes are one of the following:
                             #  {'SJR', 'HB', 'HR', 'SB', 'HJR', 'SR'}
                             bill_url = bill_row.get("href")
-                            bill_resp = requests.get(bill_url)
+                            bill_resp = self.get(bill_url)
                             bill_page = lxml.html.fromstring(bill_resp.content)
                             raw_bill_id = bill_page.xpath(
                                 ".//div[@class='col-12 col-sm-6 h2 text-center order-sm-2']/text()"

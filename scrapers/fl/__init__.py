@@ -287,7 +287,7 @@ class Florida(State):
             "classification": "primary",
             "start_date": "2026-01-13",
             "end_date": "2026-03-13",
-            "active": True,
+            "active": False,
             "extras": {"session_number": "113"},
         },
         {
@@ -314,19 +314,19 @@ class Florida(State):
             "classification": "special",
             "start_date": "2026-06-01",
             "end_date": "2026-06-05",
-            "active": True,
+            "active": False,
             "extras": {"session_number": "122"},
         },
         {
             "name": "2027 Regular Session",
             "identifier": "2027",
             "classification": "primary",
-            # TODO get real dates
-            "start_date": "2027-01-13",
-            "end_date": "2027-03-13",
-            "active": False,
-            # TODO get house session number from https://www.flhouse.gov/ (not posted as of 6/9/26)
-            # "extras": {"session_number": "113"},
+            # flsenate.gov: "The Regular Session convenes on Tuesday, March 2, 2027"
+            # (odd years start in March); a regular session lasts at most 60 consecutive days
+            "start_date": "2027-03-02",
+            "end_date": "2027-04-30",
+            "active": True,
+            "extras": {"session_number": "126"},
         },
     ]
     ignored_scraped_sessions = [
@@ -365,11 +365,9 @@ class Florida(State):
     ]
 
     def get_session_list(self):
-        # from https://stackoverflow.com/questions/38015537/python-requests-exceptions-sslerror-dh-key-too-small
         import requests
 
         requests.packages.urllib3.disable_warnings()
-        requests.packages.urllib3.util.ssl_.DEFAULT_CIPHERS += ":HIGH:!DH:!aNULL"
         return url_xpath(
             "https://flsenate.gov", "//select[@name='SessionYear']/option/text()", False
         )

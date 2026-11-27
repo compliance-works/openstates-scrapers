@@ -1,7 +1,6 @@
 # encoding=utf-8
 import os
-
-import requests
+import scrapelib
 from openstates.scrape import State
 from .bills import IlBillScraper
 from .events import IlEventScraper
@@ -169,7 +168,7 @@ class Illinois(State):
             "name": "104th Regular Session",
             "identifier": "104th",
             "start_date": "2025-01-08",
-            "end_date": "2025-05-31",
+            "end_date": "2027-01-12",
             "classification": "primary",
             "active": True,
         },
@@ -192,14 +191,15 @@ class Illinois(State):
     ]
 
     def get_session_list(self):
-        headers = {"User-Agent": os.getenv("USER_AGENT", "openstates.org")}
-        response = requests.get(
+        # User-agent "openstates.org" and "python-requests/2.32.3" are blocked as of 10/6/26
+        useragent = os.getenv("USER_AGENT", "openstates")
+        headers = {"User-Agent": useragent}
+        response = scrapelib.Scraper().get(
             "https://ilga.gov/API/Legislation/GetGeneralAssemblies",
             headers=headers,
             verify=False,
+            timeout=60,
         )
-
-        response.raise_for_status()
         session_list = [ga["gaLabel"] for ga in response.json()]
 
         return session_list

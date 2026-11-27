@@ -29,9 +29,11 @@ ACTION_CLASSIFIERS = [
     (r"Emergency Final Action.*Failed", "failure"),
     (r"Final Action.*Passed", "passage"),
     (r"Final Action.*Failed", "failure"),
+    (r"presented to Governor", "executive-receipt"),
     (r"Approved by Governor", "executive-signature"),
     (r"Vetoed by Governor", "executive-veto"),
     (r"Governor.*signed", "executive-signature"),
+    (r"become law without Governor", "became-law"),
     (r"Line Item Veto", "executive-veto-line-item"),
     (r"Veto Override.*Passed", "veto-override-passage"),
     (r"Veto Override.*Failed", "veto-override-failure"),
@@ -64,10 +66,15 @@ class KSBillScraper(Scraper):
         yield from self.scrape_bill_list(session)
 
     def scrape_bill_list(self, session):
+        biennium = next(
+            each["_scraped_name"]
+            for each in self.jurisdiction.legislative_sessions
+            if each["identifier"] == session
+        )
         page = 1
         while True:
             url = (
-                f"{BASE_URL}/measures/fragment/"
+                f"{BASE_URL}/{biennium}/measures/fragment/"
                 f"?per_page=20&types=bill&types=resolution"
                 f"&chambers=House&chambers=Senate"
                 f"&page={page}"  # &sort=number&dir=asc

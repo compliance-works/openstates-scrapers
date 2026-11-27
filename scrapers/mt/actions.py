@@ -223,7 +223,6 @@ _actions = {
 def categorize_actions(act_desc):
     atype = []
     for action_key, data in _actions.items():
-
         # If the action requires regex to be correctly classified
         if data["type"] == "regex":
             if re.search(action_key, act_desc.lower()):
@@ -234,4 +233,4 @@ def categorize_actions(act_desc):
             if action_key in act_desc.lower():
                 atype.extend(a for a in data["mappings"])
 
-    return atype
+    return list(dict.fromkeys(atype))

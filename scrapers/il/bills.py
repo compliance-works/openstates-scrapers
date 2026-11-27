@@ -7,6 +7,7 @@ import scrapelib
 import lxml.html
 from openstates.scrape import Scraper, Bill, VoteEvent
 from openstates.utils import convert_pdf
+from utils import SSLRetryMixin
 
 
 BASE_URL = "https://ilga.gov"
@@ -19,11 +20,10 @@ headers = {
 }
 
 session_details = {
-    # TODO, fill these in once appointed
     # TODO: move this to session metadata
     "104th": {
-        "speaker": "",
-        "president": "",
+        "speaker": "Welch",
+        "president": "Harmon",
         "params": {"GA": "104", "SessionId": "114"},
     },
     "103rd": {
@@ -264,7 +264,6 @@ def _categorize_action(action):
     related_orgs = []
 
     for pattern, atype in _action_classifiers:
-
         if pattern.findall(action):
             if "referral-committee" in atype:
                 related_orgs = [pattern.sub("", action).strip()]
@@ -286,7 +285,7 @@ def chamber_slug(chamber):
     return "S"
 
 
-class IlBillScraper(Scraper):
+class IlBillScraper(SSLRetryMixin, Scraper):
     LEGISLATION_URL = f"{BASE_URL}/Legislation/"
     localize = pytz.timezone("America/Chicago").localize
 
@@ -513,9 +512,9 @@ class IlBillScraper(Scraper):
             doc = lxml.html.fromstring(html)
             doc.make_links_absolute(url)
         except scrapelib.HTTPError as e:
-            assert (
-                "500" in e.args[0]
-            ), "Unexpected error when accessing page: {}".format(e)
+            assert "500" in e.args[0], (
+                "Unexpected error when accessing page: {}".format(e)
+            )
             self.warning("500 error for bill page; skipping bill")
             return
 
@@ -574,13 +573,14 @@ class IlBillScraper(Scraper):
             #     except ValueError:
             #         self.warning("Can't resolve committee for %s" % classification)
 
-            bill.add_action(
+            act = bill.add_action(
                 action,
                 date,
                 chamber=actor_id,
                 classification=classification,
-                related_entities=related_orgs,
             )
+            for org in filter(None, related_orgs):
+                act.add_related_entity(org, "organization")
 
             # if action.lower().find("sponsor") != -1:
             #     self.refine_sponsor_list(actor, action, sponsor_list, bill_id)
@@ -603,9 +603,12 @@ class IlBillScraper(Scraper):
         self.scrape_documents(bill, version_url)
         yield bill
 
-        # temporarily remove vote processing due to pdf issues
-        votes_url = doc.xpath('//a[text()="Votes"]/@href')[0]
-        yield from self.scrape_votes(session, bill, votes_url)
+        # Every roll call on the Votes tab also shows its tally in an action
+        # ("Third Reading - Short Debate - Passed 108-000-000"), so most bills
+        # can skip that page
+        if any(re.search(r"\d{3}-\d{3}-\d{3}", a["description"]) for a in bill.actions):
+            votes_url = doc.xpath('//a[text()="Votes"]/@href')[0]
+            yield from self.scrape_votes(session, bill, votes_url)
 
     def scrape_documents(self, bill, version_url):
         html = self.get(version_url, headers=headers, verify=False).text
@@ -665,7 +668,7 @@ class IlBillScraper(Scraper):
                 bill.add_version_link(name, url, media_type=mimetype)
             elif name in FULLTEXT_DOCUMENT_TYPES:
                 bill.add_document_link(name, url)
-            elif "Printer-Friendly" or "Printer Friendly" in name:
+            elif "Printer-Friendly" in name or "Printer Friendly" in name:
                 pass
             else:
                 self.warning("unknown document type %s - adding as document" % name)
@@ -686,30 +689,22 @@ class IlBillScraper(Scraper):
             pieces = link.text.split(" - ")
             date = pieces[-1]
 
-            vote_type = link.xpath("../a/text()")[0]
+            # each table's <th> says whether it holds committee or floor votes
+            vote_type = link.xpath("ancestor::table[1]//th[1]/text()")[0].strip()
             if vote_type == "Committee Hearing Votes":
-                chamber = link.xpath("../following-sibling::td/text()")[0]
-                actor = "upper" if chamber == "SENATE" else "lower"
-
-                # depends on bill type
                 motion = "Do Pass"
-                if pieces[0].startswith(("SCA", "HCA")):
-                    amendment_num = int(re.split(r"SCA|HCA", pieces[0])[-1])
-                    amendment = ", Amendment %s" % amendment_num
-                    motion += amendment
+            elif len(pieces) == 3:
+                motion = pieces[1].strip()
             else:
-                if len(pieces) == 3:
-                    motion = pieces[1].strip()
-                else:
-                    motion = "Third Reading"
+                motion = "Third Reading"
 
-                if pieces[0].startswith(("SFA", "HFA")):
-                    amendment_num = int(re.split(r"SFA|HFA", pieces[0])[-1])
-                    amendment = ", Amendment %s" % amendment_num
-                    motion += amendment
+            # committees vote on floor amendments (SFA) too, so keep the
+            # number for any amendment type
+            if re.match(r"[SH][CF]A", pieces[0]):
+                motion += ", Amendment %s" % int(pieces[0][3:])
 
-                actor = link.xpath("../following-sibling::td/text()")[0]
-                actor = "upper" if actor.upper() == "SENATE" else "lower"
+            actor = link.xpath("../following-sibling::td/text()")[0]
+            actor = "upper" if actor.strip().upper() == "SENATE" else "lower"
 
             classification, _ = _categorize_action(motion)
 
@@ -726,7 +721,7 @@ class IlBillScraper(Scraper):
 
             # manual fix for bad bill. TODO: better error catching here
             vote = self.scrape_pdf_for_votes(
-                session, actor, date, motion.strip(), link.get("href")
+                session, actor, date, motion.strip(), link.get("href"), bill.actions
             )
             if vote:
                 vote.set_bill(bill)
@@ -746,7 +741,7 @@ class IlBillScraper(Scraper):
             self.warning("404 error for vote; skipping vote")
             return False
 
-    def scrape_pdf_for_votes(self, session, actor, date, motion, href):
+    def scrape_pdf_for_votes(self, session, actor, date, motion, href, actions=()):
         warned = False
         # vote indicator, a few spaces, a name, newline or multiple spaces
         # VOTE_RE = re.compile('(Y|N|E|NV|A|P|-)\s{2,5}(\w.+?)(?:\n|\s{2})')
@@ -755,7 +750,7 @@ class IlBillScraper(Scraper):
         )
         PASS_FAIL_WORDS = {
             "PASSED": "pass",
-            "PREVAILED": "fail",
+            "PREVAILED": "pass",
             "ADOPTED": "pass",
             "CONCURRED": "pass",
             "FAILED": "fail",
@@ -846,6 +841,26 @@ class IlBillScraper(Scraper):
                     % (no_count, len(no_votes))
                 )
                 warned = True
+
+        if passed is None:
+            # Senate roll calls print no result word, so use the bill action
+            # that records the same tally, e.g. "Third Reading - Passed; 052-000-000"
+            tally = "%03d-%03d-%03d" % (yes_count, no_count, present_count)
+            results = set()
+            for action in actions:
+                text = action["description"]
+                if (
+                    str(action["date"]) != str(date)
+                    or tally not in text
+                    or actor not in action["organization_id"]
+                ):
+                    continue
+                if re.search(r"\b(Lost|Failed)\b|Non-Concur", text):
+                    results.add("fail")
+                elif re.search(r"\b(Passed|Prevailed|Adopted|Concurs)\b", text):
+                    results.add("pass")
+            if len(results) == 1:
+                passed = results.pop()
 
         if passed is None:
             if actor == "lower":  # senate doesn't have these lines

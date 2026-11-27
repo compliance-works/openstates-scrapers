@@ -1,4 +1,4 @@
-import requests
+import scrapelib
 import lxml
 from openstates.scrape import State
 from .bills import DEBillScraper
@@ -112,6 +112,14 @@ class Delaware(State):
             "end_date": "2026-06-30",
             "active": True,
         },
+        {
+            "_scraped_name": "2026 - 2028 (GA 154)",
+            "identifier": "154",
+            "name": "154th General Assembly (2027-2028)",
+            "start_date": "2027-01-12",
+            "end_date": "2028-06-30",
+            "active": False,
+        },
     ]
     ignored_scraped_sessions = [
         "1932 - 1934 (GA 104)",
@@ -151,7 +159,7 @@ class Delaware(State):
 
         url = "https://legis.delaware.gov/"
 
-        page = requests.get(url, headers=headers, verify=False).content
+        page = scrapelib.Scraper().get(url, headers=headers, timeout=60).content
         page = lxml.html.fromstring(page)
 
         sessions = page.xpath('//select[@id="billSearchGARefiner"]/option/text()')

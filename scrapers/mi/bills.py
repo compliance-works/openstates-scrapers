@@ -3,6 +3,8 @@ import re
 import lxml.html
 import scrapelib
 import collections
+import functools
+import zlib
 from datetime import date
 from utils.media import get_media_type
 
@@ -41,9 +43,12 @@ def categorize_action(action: str) -> str:
             return atype
 
 
+def element_text(el) -> str:
+    return el.text_content().replace("\xa0", " ").replace("\r\n", " ")
+
+
 class MIBillScraper(Scraper):
     headers = {}
-    verify = False
 
     # convert from MI's redirector to a bill permalink
     def make_bill_url(self, url: str) -> str:
@@ -74,10 +79,17 @@ class MIBillScraper(Scraper):
         #     bill_id = link.xpath("text()")[0].split(" of ")[0]
         #     yield from self.scrape_bill(session, bill_id, bill_url)
 
+        # The search results can repeat a bill at a pagination boundary. Keep
+        # the canonical detail URL so a repeated listing cannot produce a
+        # duplicate bill (and duplicate import record).
+        seen_bill_urls = set()
         for link in page.xpath(
             "//div[contains(@class,'tableScrollWrapper')]/table[1]/tbody/tr/td[1]/a"
         ):
             bill_url = self.make_bill_url(link.xpath("@href")[0])
+            if bill_url in seen_bill_urls:
+                continue
+            seen_bill_urls.add(bill_url)
             bill_id = link.xpath("text()")[0].split(" of ")[0]
             yield from self.scrape_bill(session, bill_id, bill_url)
 
@@ -238,7 +250,30 @@ class MIBillScraper(Scraper):
                     vote_url, rc_num, bill.legislative_session
                 )
 
-                if results is not None:
+                if results == {}:
+                    # the bill page links a journal without this roll call (a
+                    # site error), so keep the action text's counts, no voters
+                    counts = {
+                        option: int(count.group(1))
+                        for option in ("yeas", "nays", "excused", "not voting")
+                        if (count := re.search(rf"{option} (\d+)", action, re.I))
+                    }
+                    yeas, nays = counts.get("yeas", 0), counts.get("nays", 0)
+                    vote = VoteEvent(
+                        start_date=when,
+                        chamber=actor,
+                        bill=bill,
+                        motion_text=action,
+                        result="pass" if yeas > nays else "fail",
+                        classification="passage",
+                    )
+                    for option, value in counts.items():
+                        vote.set_count(
+                            {"yeas": "yes", "nays": "no"}.get(option, option), value
+                        )
+                    vote.add_source(vote_url)
+                    yield vote
+                elif results is not None:
                     vote_passed = len(results["yes"]) > len(results["no"])
                     vote = VoteEvent(
                         start_date=when,
@@ -269,6 +304,13 @@ class MIBillScraper(Scraper):
                     vote.set_count("yes", len(results["yes"]))
                     vote.set_count("no", len(results["no"]))
                     vote.set_count("other", len(results["other"]))
+                    # House journals don't name excused or non-voting members,
+                    # so take those counts from the action text
+                    if not results["other"]:
+                        for option in ("excused", "not voting"):
+                            count = re.search(rf"{option} (\d+)", action, re.I)
+                            if count:
+                                vote.set_count(option, int(count.group(1)))
                     possible_vote_results = ["yes", "no", "other"]
                     for pvr in possible_vote_results:
                         for name in results[pvr]:
@@ -311,48 +353,83 @@ class MIBillScraper(Scraper):
         objectname = f"{year}-{journal_prefix}-{date_formatted}-{journal_num}"
         return f"{base_url}/documents/{legislative_session}/Journal/{chamber}/htm/{objectname}.htm"
 
+    # A journal holds a whole day's roll calls, and bills far apart in the
+    # list point back to the same journal, so keep every journal fetched,
+    # compressed (about 10x smaller)
+    @functools.cache
+    def get_journal(self, url):
+        return zlib.compress(self.get(url, headers=self.headers, verify=False).content)
+
     def parse_roll_call(self, url, rc_num, session):
         try:
-            resp = self.get(url, headers=self.headers, verify=False)
+            content = zlib.decompress(self.get_journal(url))
         except scrapelib.HTTPError:
             self.warning(
                 f"Could not fetch roll call document at {url}, unable to extract vote"
             )
             return
-        html = resp.text
-        vote_doc = lxml.html.fromstring(html)
+        # journals are UTF-8 but don't say so in the response headers, so parse
+        # the bytes and let lxml use the charset the document itself declares
+        vote_doc = lxml.html.fromstring(content)
         vote_doc_textonly = vote_doc.text_content()
 
         if re.search("In\\s+The\\s+Chair", vote_doc_textonly) is None:
             self.warning('"In The Chair" indicator not found, unable to extract vote')
             return
 
-        # Split the file into lines using the <p> tags
-        pieces = [
-            p.text_content().replace("\xa0", " ").replace("\r\n", " ")
-            for p in vote_doc.xpath("//p")
-        ]
+        # Split the file into lines using the <p> tags; Senate journals often
+        # print the "Excused"/"Not Voting" (sometimes "Nays") headers as <h4>
+        pieces = []
+        for el in vote_doc.xpath(
+            "//p[not(ancestor::tr)] | //h4[not(ancestor::tr)] | //tr[not(ancestor::tr)]"
+        ):
+            if el.tag == "tr":
+                pieces.extend(self.row_lines(el))
+            else:
+                pieces.append(element_text(el))
 
         # Go until we find the roll call
         for i, p in enumerate(pieces):
             if p.startswith(f"Roll Call No. {rc_num}"):
                 break
+        else:
+            self.warning(f"Roll Call No. {rc_num} not found in {url}")
+            return {}
 
         vtype = None
         results = collections.defaultdict(list)
+        # The journal's own opening roll ("Albert—present") names every member,
+        # including the multi-word ones, and is the only way to tell where one
+        # name ends and the next begins in a collapsed line of names
+        roster = set()
+        for p in pieces:
+            # a line can hold several ("Damoose—present Geiss—present")
+            if re.match(r".+?—(?:present|excused|absent)", p.strip(), re.I):
+                roster.update(
+                    re.findall(r"\s*(.+?)—(?:present|excused|absent)", p, re.I)
+                )
 
         # Once we find the roll call, go through voters
-        for p in pieces[i:]:
-            if "Yeas" in p:
-                vtype = "yes"
+        for j, p in enumerate(pieces[i:]):
+            # Stop at the next roll call so its voters aren't merged into this one
+            if j and p.startswith("Roll Call No."):
+                break
+            # "In The Chair:" can share a <p> with the last voter names
+            p, chair, _ = p.partition("In The Chair:")
+            # A header can share a line with the next one ("Nays—0 Excused—5"),
+            # so check them last-to-first
+            if "Excused" in p or "Not Voting" in p:
+                vtype = "other"
             elif "Nays" in p:
                 vtype = "no"
-            elif "Excused" in p or "Not Voting" in p:
-                vtype = "other"
+            elif "Yeas" in p:
+                vtype = "yes"
             elif "Roll Call No" in p:
                 continue
-            elif p.startswith("In The Chair:"):
-                break
+            # Senate journals print the clock time ("7:56 a.m.") inside a roll
+            # call taken after midnight
+            elif re.fullmatch(r"\d{1,2}:\d{2} [ap]\.m\.", p.strip()):
+                continue
             elif vtype:
                 # Split on tabs (House journals) or multiple spaces (Senate journals)
                 for line in re.split(r"\t|(?<!,)\s{2,}", p):
@@ -361,11 +438,65 @@ class MIBillScraper(Scraper):
                             for leg in line.split():
                                 results[vtype].append(leg)
                         else:
-                            results[vtype].append(line)
+                            results[vtype].extend(self.split_names(line, roster))
             else:
                 self.warning("piece without vtype set: %s", p)
+            if chair:
+                break
 
         return results
+
+    @staticmethod
+    def row_lines(row):
+        """Journals are converted from PDF, and the converter can stack several
+        printed lines into one table row: each cell holds its column's lines
+        separated by blank paragraphs, and a "Nays—2" header or "In The Chair"
+        can sit in a column beside names printed above or below it. Read the
+        row line by line, putting headers before the names on the same line
+        and the chair after them."""
+        columns = []
+        for td in row.xpath("td"):
+            blocks = [[]]
+            for p in td.xpath(".//p | .//h4"):
+                text = element_text(p)
+                if text.strip():
+                    blocks[-1].append(text)
+                else:
+                    blocks.append([])
+            columns.append(blocks)
+
+        def order(text):
+            if "In The Chair" in text:
+                return 2
+            if re.search("Roll Call No|Yeas|Nays|Excused|Not Voting", text):
+                return 0
+            return 1
+
+        lines = []
+        for k in range(max(map(len, columns), default=0)):
+            line = [text for col in columns if k < len(col) for text in col[k]]
+            lines.extend(sorted(line, key=order))
+        return lines
+
+    @staticmethod
+    def split_names(line, roster):
+        """Senate journals collapse a row of names into one space-separated
+        line ("Albert Bellino Bumstead Daley"), and names themselves can
+        contain spaces ("McDonald Rivet"), so split on the journal's roster.
+        Anything that isn't entirely member names is left untouched."""
+        names = []
+        rest = line.strip()
+        while rest:
+            match = max(
+                (n for n in roster if rest == n or rest.startswith(f"{n} ")),
+                key=len,
+                default=None,
+            )
+            if not match:
+                return [line]
+            names.append(match)
+            rest = rest[len(match) :].strip()
+        return names
 
     def scrape_legal(self, bill: Bill, page: lxml.html.HtmlElement):
         for row in page.xpath(

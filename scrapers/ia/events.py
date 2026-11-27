@@ -3,10 +3,11 @@ import datetime
 import lxml.html
 import pytz
 
-from openstates.scrape import Scraper, Event
+from openstates.scrape import Event
+from .utils import IAScraper
 
 
-class IAEventScraper(Scraper):
+class IAEventScraper(IAScraper):
     _tz = pytz.timezone("US/Central")
     chambers = {"upper": "Senate", "lower": "House"}
 
@@ -228,6 +229,7 @@ class IAEventScraper(Scraper):
                         "location": location,
                         "status": status,
                     },
+                    "comm": comm,
                     "agenda_list": [{"agenda_item": agenda_desc, "bill": bill_id}],
                 }
             else:
@@ -256,6 +258,8 @@ class IAEventScraper(Scraper):
                 agenda.add_bill(agenda_detail["bill"])
 
             sub_comm_event.add_source(url)
-            sub_comm_event.add_participant(comm, note="host", type="committee")
+            sub_comm_event.add_participant(
+                sub_comm_meeting["comm"], note="host", type="committee"
+            )
 
             yield sub_comm_event

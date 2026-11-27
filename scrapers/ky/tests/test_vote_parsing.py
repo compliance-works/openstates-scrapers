@@ -14,6 +14,7 @@ Both are exercised here against real vote-history PDFs fetched from
 apps.legislature.ky.gov (2025RS, HB1 and HB90) which reproduce each bug.
 Run directly: `python3 -m scrapers.ky.tests.test_vote_parsing`
 """
+
 import os
 import shutil
 import tempfile
@@ -79,9 +80,18 @@ def test_abstained_section_not_double_counted():
     assert itemized["other"] == 9, itemized
 
 
+def test_vote_chamber_from_pdf_header():
+    """HB90's vote history mixes House (RCS#) and Senate (RSN#) roll calls."""
+    votes = _get_votes("hb90_vote_history.pdf")
+    chambers = [v.organization.split('"')[-2] for v in votes]
+    assert chambers == ["lower", "upper", "lower", "lower", "upper"], chambers
+    assert votes[1].start_date == "2025-03-13T09:17:16-04:00"
+
+
 def demo():
     test_not_voting_matches_declared_count()
     test_abstained_section_not_double_counted()
+    test_vote_chamber_from_pdf_header()
     print("OK: KY vote parsing matches declared counts for both regression fixtures")
 
 

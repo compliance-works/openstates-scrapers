@@ -1,6 +1,7 @@
 import re
 import datetime as dt
-from collections import defaultdict
+import functools
+from collections import Counter, defaultdict
 
 import pytz
 
@@ -37,7 +38,7 @@ extended_type_map = {
     "HCR": "concurrent resolution",
     "SCR": "concurrent resolution",
     "HR": "resolution",
-    "SR": "resolutoin",
+    "SR": "resolution",
     "JR": "resolution",
     "HJR": "joint resolution",
     "SJR": "joint resolution",
@@ -47,17 +48,87 @@ extended_type_map = {
     "SSSB": "bill",
     "SSHB": "bill",
     "CACR": "constitutional amendment",
-    "PET": "petition,",
+    "PET": "petition",
 }
 
 VERSION_URL = "https://gc.nh.gov/legislation/%s/%s.html"
 AMENDMENT_URL = "https://gc.nh.gov/legislation/amendments/%s.html"
+
+# RollCallHistory.txt codes other than Yea/Nay
+NON_VOTE_OPTIONS = {
+    "Not Voting/Excused": "excused",
+    "Not Voting/Not Excused": "absent",
+    "Presiding": "not voting",
+}
+WEB_NON_VOTE_OPTIONS = {
+    "Excused": "excused",
+    "Not Voting": "absent",
+    "Presiding": "not voting",
+}
 
 
 def extract_amendment_id(action):
     piece = re.findall(r"Amendment #(\d{4}-\d+[hs])", action)
     if piece:
         return piece[0]
+
+
+JOURNAL_CITE = re.compile(r"(\d{1,2}/\d{1,2}/(\d{4}))[;,]?\s+([HS]J \d+)")
+
+
+def journal_cite(action):
+    match = JOURNAL_CITE.search(action)
+    if match and "recess" not in action.lower():
+        return match.group(1), (match.group(3), match.group(2))
+    return None, None
+
+
+def journal_dates(actions):
+    """Most-cited date for each journal, keyed like ("HJ 8", "2026")."""
+    counts = defaultdict(Counter)
+    for action in actions:
+        date, journal = journal_cite(action)
+        if date:
+            counts[journal][date] += 1
+    return {journal: c.most_common(1)[0][0] for journal, c in counts.items()}
+
+
+def action_date(action, timestamp, journals=None):
+    """
+    Docket.txt's timestamp is when the entry was posted, which can be days
+    before or after the floor action. Prefer the date cited with the journal
+    page ("03/11/2026  HJ 7", "05/14/2026;  SJ 12"), except on "in recess"
+    entries, where that is the date of the recessed session, and on journal
+    dates weeks after posting, which are clerk typos ("09/19/2026  HJ 16").
+    A floor vote (MA/MF) takes its journal's date, since the clerk's date is
+    sometimes a day off ("03/13/2026  HJ 8" on the 03/12 journal).
+    """
+    posted = dt.datetime.strptime(timestamp, "%m/%d/%Y %H:%M:%S %p")
+    date, journal = journal_cite(action)
+    if date:
+        if re.search(r"\b(MA|MF)\b", action):
+            date = (journals or {}).get(journal, date)
+        journal = dt.datetime.strptime(date, "%m/%d/%Y")
+        if journal <= posted + dt.timedelta(days=14):
+            return journal
+    return posted
+
+
+def unmark_referred_passage(actions):
+    """
+    A House floor vote on an Ought to Pass report that is then referred to
+    Finance or Ways and Means (House Rule 47) isn't passage; the floor vote
+    after that committee reports is.
+    """
+    for vote, referral in zip(actions, actions[1:]):
+        if (
+            "passage" in vote["classification"]
+            and '"lower"' in vote["organization_id"]
+            and re.match(
+                r"Referred to (Finance|Ways and Means)", referral["description"]
+            )
+        ):
+            vote["classification"].remove("passage")
 
 
 class NHBillScraper(Scraper):
@@ -72,6 +143,9 @@ class NHBillScraper(Scraper):
             self.warning("NH bans scraping between 6am and 9pm. This may fail.")
 
         chambers = [chamber] if chamber else ["upper", "lower"]
+        if scrape_from_web:
+            # the RSS feed lists every bill regardless of chamber; read it once
+            chambers = chambers[:1]
         for chamber in chambers:
             yield from self.scrape_chamber(chamber, session, scrape_from_web)
 
@@ -121,7 +195,7 @@ class NHBillScraper(Scraper):
         tries = 3
         # we have to be prepared to retry, because sometimes NH responds with a basically empty HTML response
         # (contains only some inline Javascript snippet)
-        while try_num < tries and (
+        while try_num <= tries and (
             docket_content is None or "<head></head>" in docket_content
         ):
             if try_num > 1:
@@ -138,7 +212,7 @@ class NHBillScraper(Scraper):
 
         docket_page = lxml.html.fromstring(docket_content)
         version_elems = docket_page.xpath(
-            "//table[@id='Table1']//a[contains(@href, 'billtext.aspx') or contains(@href, 'billText.aspx')]"
+            "//table[contains(@class, 'docket-table')]//a[contains(@href, 'billtext.aspx') or contains(@href, 'billText.aspx')]"
         )
         version_urls_seen = []
         for version_elem in version_elems:
@@ -148,7 +222,10 @@ class NHBillScraper(Scraper):
                 continue
             else:
                 version_urls_seen.append(version_url)
-            version_text = version_elem.xpath(".//text()")[0]
+            version_text = version_elem.text_content().replace(
+                "(opens in new window)", ""
+            )
+            version_text = re.sub(r"#\s+", "#", version_text).strip()
             if "txtFormat=html" in version_url:
                 # "normal" version (maybe always Introduced?)
                 bill.add_version_link(
@@ -184,10 +261,29 @@ class NHBillScraper(Scraper):
                     url=f"https://gc.nh.gov/bill_status/legacy/bs2016/{pdf_version_url}",
                     media_type="application/pdf",
                 )
+            elif "txtFormat=report" in version_url:
+                # Senate hearing reports (testimony summaries) and committee reports
+                date, body = [
+                    cell.text_content().strip()
+                    for cell in version_elem.xpath("./ancestor::tr[1]/td")[:2]
+                ]
+                kind = version_text.rstrip(":").replace("Hearing", "Hearing Report")
+                bill.add_document_link(
+                    note=f"{body} {kind}",
+                    date=dt.datetime.strptime(date, "%m/%d/%Y").strftime("%Y-%m-%d"),
+                    url=f"https://gc.nh.gov/bill_status/legacy/bs2016/{version_url}",
+                    media_type="text/html",
+                )
             else:
                 self.logger.warning(
                     f"Found an unexpected version URL on {docket_url}, version URL: {version_url}"
                 )
+
+        # the bill text links carry the bill's billinfo.aspx id
+        for version_url in version_urls_seen:
+            match = re.search(r"[?&]id=(\d+)(&|$)", version_url)
+            if "txtFormat=html" in version_url and match:
+                return match.group(1)
 
     def scrape_sponsors_from_bill_page(self, bill, bill_page):
         """
@@ -208,6 +304,9 @@ class NHBillScraper(Scraper):
             link_text = link.text_content().strip()
 
             is_primary = "(Prime)" in link_text
+            # Link text is usually just the surname, minus "(Prime)" and party marker
+            link_name = re.sub(r"\(Prime\)", "", link_text)
+            link_name = re.sub(r"\s*\([A-Za-z]\)\s*$", "", link_name).strip()
 
             if title_attr:
                 # Strip leading honorific ("Rep. " / "Sen. ") and any trailing
@@ -216,10 +315,18 @@ class NHBillScraper(Scraper):
                 # match case-insensitively.
                 name = re.sub(r"^(Rep\.|Sen\.)\s+", "", title_attr)
                 name = re.sub(r"\s*\([A-Za-z]\)\s*$", "", name).strip()
+                # NH single-quotes the title without escaping apostrophes
+                # (title='Rep. Terri O'Rorke (D)'), so it parses as "Rep. Terri O"
+                # and loses its party marker. Finish the name from the link text.
+                head, apostrophe, tail = link_name.partition("'")
+                if (
+                    apostrophe
+                    and not re.search(r"\([A-Za-z]\)$", title_attr)
+                    and name.endswith(head)
+                ):
+                    name = f"{name}'{tail}"
             else:
-                # Fallback: derive from link text, removing "(Prime)" and party marker
-                name = re.sub(r"\(Prime\)", "", link_text)
-                name = re.sub(r"\s*\([A-Za-z]\)\s*$", "", name).strip()
+                name = link_name
 
             if not name:
                 continue
@@ -235,6 +342,25 @@ class NHBillScraper(Scraper):
 
         if added == 0:
             self.warning(f"No sponsors found on bill page for {bill.identifier}")
+
+    def scrape_sponsors_from_legacy_page(self, bill, lsr, session, page=None):
+        """
+        Some bill pages list no sponsors, e.g. when the prime sponsor has left
+        the House and dropped out of legislators.txt. The legacy bill status
+        page still names them.
+        """
+        if page is None:
+            url = f"https://gc.nh.gov/bill_status/legacy/bs2016/bill_status.aspx?lsr={lsr}&sy={session}&sortoption=&txtsessionyear={session}"
+            page = lxml.html.fromstring(self.get(url, verify=False).content)
+        for sponsor in page.xpath("//ul[@class='sponsor-list']/li"):
+            name = sponsor.xpath("./*[1]")[0].text_content().strip()
+            is_primary = bool(sponsor.xpath(".//*[contains(@class, 'prime')]"))
+            bill.add_sponsorship(
+                classification="primary" if is_primary else "cosponsor",
+                name=name,
+                entity_type="person",
+                primary=is_primary,
+            )
 
     def scrape_from_web(self, session):
         bills = {}
@@ -258,7 +384,7 @@ class NHBillScraper(Scraper):
 
             bills[lsr] = Bill(
                 legislative_session=session,
-                chamber=chamber_map[item.billnumber[0:1]],
+                chamber=chamber_map.get(item.billnumber[0:1], "legislature"),
                 identifier=bill_id,
                 title=item.lsrtitle.replace("\n", ""),
                 classification=bill_type,
@@ -354,6 +480,7 @@ class NHBillScraper(Scraper):
         self.bills_by_id = {}  # need a second table to attach votes
         self.versions_by_lsr = {}  # mapping of bill ID to lsr
         self.amendments_by_lsr = {}
+        self.from_legacy_pages = False
 
         # pre load the mapping table of LSR -> version id
         self.scrape_version_ids()
@@ -363,14 +490,10 @@ class NHBillScraper(Scraper):
             self.info("Scraping from web.")
             self.bills = self.scrape_from_web(session)
         else:
-
             # Guardrail: NH's bulk data dump has been intermittently returning empty
             # files (e.g. LSRs.txt returning 0 bytes). Detect that upfront so the run
             # fails loudly rather than silently emitting an empty scrape.
-            lsrs_content = self.get(
-                f"https://gc.nh.gov/dynamicdatadump/LSRs.txt?x={self.cachebreaker}",
-                verify=False,
-            ).content.decode("utf-8")
+            lsrs_content = self.get_dump("LSRs.txt")
             # A healthy LSRs.txt is hundreds of KB. Anything under 1 KB is effectively empty.
             if len(lsrs_content.strip()) < 1024:
                 raise RuntimeError(
@@ -459,30 +582,34 @@ class NHBillScraper(Scraper):
                         self.scrape_versions_from_web_2026(self.bills[lsr], bill_page)
                         self.scrape_sponsors_from_bill_page(self.bills[lsr], bill_page)
                     else:
-                        self.warning(
-                            f"Missing version_id for {bill_id}, can't build bill page"
-                        )
-                        self.bills[lsr].add_source(
-                            "https://gc.nh.gov/bill_Status/advanced.aspx"
-                        )
                         # Bill's LSR is missing from the bulk-data dump (e.g. a
                         # carryover bill from a prior session year) — fall back
                         # to the docket page, which can be queried by LSR + session
                         # year directly, to still capture version/document links.
-                        self.scrape_versions_from_docket(self.bills[lsr], lsr, session)
+                        version_id = self.scrape_versions_from_docket(
+                            self.bills[lsr], lsr, session
+                        )
+                        if version_id:
+                            self.add_source(self.bills[lsr], version_id)
+                            bill_page = self.get_bill_page(version_id)
+                            self.scrape_sponsors_from_bill_page(
+                                self.bills[lsr], bill_page
+                            )
+                        else:
+                            self.warning(
+                                f"Missing version_id for {bill_id}, can't build bill page"
+                            )
+                            self.bills[lsr].add_source(
+                                "https://gc.nh.gov/bill_Status/advanced.aspx"
+                            )
+
+            if not self.bills:
+                self.info(f"No {session} bills in LSRs.txt, using legacy pages.")
+                self.scrape_bills_from_legacy_pages(chamber, session)
 
         # load legislators
         self.legislators = {}
-        for line in (
-            self.get(
-                "https://gc.nh.gov/dynamicdatadump/legislators.txt?x={}".format(
-                    self.cachebreaker
-                ),
-                verify=False,
-            )
-            .content.decode("utf-8")
-            .split("\n")
-        ):
+        for line in self.get_dump("legislators.txt").split("\n"):
             if len(line) < 2:
                 continue
 
@@ -512,14 +639,7 @@ class NHBillScraper(Scraper):
         # bills, or a transient page render issue). It is intentionally SKIPPED
         # for any bill that already has sponsors, to avoid adding duplicate
         # sponsor entries under slightly-different name spellings.
-        for line in (
-            self.get(
-                f"https://gc.nh.gov/dynamicdatadump/LsrSponsors.txt?x={self.cachebreaker}",
-                verify=False,
-            )
-            .content.decode("utf-8")
-            .split("\n")
-        ):
+        for line in self.get_dump("LsrSponsors.txt").split("\n"):
             if len(line) < 1:
                 continue
 
@@ -552,13 +672,11 @@ class NHBillScraper(Scraper):
                     self.warning("Error, can't find person %s" % employee)
 
         # actions
-        action_lines = (
-            self.get(
-                f"https://gc.nh.gov/dynamicdatadump/Docket.txt?x={self.cachebreaker}",
-                verify=False,
-            )
-            .content.decode("utf-8")
-            .split("\n")
+        action_lines = self.get_dump("Docket.txt").split("\n")
+        journals = journal_dates(
+            line.split("|")[5]
+            for line in action_lines
+            if line.count("|") == 6 and line.split("|")[0].lstrip("\ufeff") == session
         )
         for line in action_lines:
             if len(line) < 1:
@@ -567,12 +685,13 @@ class NHBillScraper(Scraper):
             if "|" not in line:
                 continue
 
+            line = line.lstrip("\ufeff")
             (session_yr, lsr, timestamp, bill_id, body, action, _) = line.split("|")
 
             if session_yr == session and lsr in self.bills:
                 actor = "lower" if body == "H" else "upper"
-                time = dt.datetime.strptime(timestamp, "%m/%d/%Y %H:%M:%S %p")
                 action = action.strip()
+                time = action_date(action, timestamp, journals)
                 action_attr = self.categorizer.categorize(action)
                 classification = action_attr["classification"]
 
@@ -591,11 +710,32 @@ class NHBillScraper(Scraper):
                 #         on_duplicate="ignore",
                 #     )
 
-        yield from self.scrape_votes(session)
+        if self.from_legacy_pages:
+            yield from self.scrape_votes_from_legacy_pages(session)
+        else:
+            yield from self.scrape_votes(session)
 
         # save all bills
         for bill in self.bills:
+            if not self.bills[bill].sponsorships and not self.from_legacy_pages:
+                try:
+                    self.scrape_sponsors_from_legacy_page(
+                        self.bills[bill], bill, session
+                    )
+                except Exception as e:
+                    self.warning(
+                        f"Failed to scrape sponsors from legacy page for LSR {bill}: {e}"
+                    )
+            unmark_referred_passage(self.bills[bill].actions)
             yield self.bills[bill]
+
+    @functools.cache
+    def get_dump(self, name):
+        # both chambers read the same bulk files; fetch each once per run
+        return self.get(
+            f"https://gc.nh.gov/dynamicdatadump/{name}?x={self.cachebreaker}",
+            verify=False,
+        ).content.decode("utf-8")
 
     def add_source(self, bill: Bill, id: str):
         bill_url = f"https://gc.nh.gov/bill_Status/billinfo.aspx?id={id}&inflect=2"
@@ -603,16 +743,7 @@ class NHBillScraper(Scraper):
 
     def scrape_version_ids(self):
 
-        for line in (
-            self.get(
-                "https://gc.nh.gov/dynamicdatadump/LsrsOnly.txt?x={}".format(
-                    self.cachebreaker
-                ),
-                verify=False,
-            )
-            .content.decode("utf-8")
-            .split("\n")
-        ):
+        for line in self.get_dump("LsrsOnly.txt").split("\n"):
             if len(line) < 1:
                 continue
             # a few blank/irregular lines, irritating
@@ -626,16 +757,7 @@ class NHBillScraper(Scraper):
             self.versions_by_lsr[lsr] = file_id
 
     def scrape_amendments(self):
-        for line in (
-            self.get(
-                "https://gc.nh.gov/dynamicdatadump/Docket.txt?x={}".format(
-                    self.cachebreaker
-                ),
-                verify=False,
-            )
-            .content.decode("utf-8")
-            .split("\n")
-        ):
+        for line in self.get_dump("Docket.txt").split("\n"):
             if len(line) < 1:
                 continue
             # a few blank/irregular lines, irritating
@@ -650,15 +772,133 @@ class NHBillScraper(Scraper):
             for match in amendment_regex.finditer(line[5]):
                 self.amendments_by_lsr[lsr] = match.group(1)
 
+    def get_legacy_page(self, path):
+        url = f"https://gc.nh.gov/bill_status/legacy/bs2016/{path}"
+        return url, lxml.html.fromstring(self.get(url, verify=False).content)
+
+    def scrape_bills_from_legacy_pages(self, chamber, session):
+        """
+        The bulk dump only carries the current year's bills, sponsors and roll
+        calls, but Docket.txt keeps the prior year's actions, so a past
+        session's bills are listed from it and filled in from the legacy pages.
+        """
+        self.from_legacy_pages = True
+        self.lsrs_with_roll_calls = set()
+        bill_ids = {}
+        for line in self.get_dump("Docket.txt").split("\n"):
+            line = line.replace("\ufeff", "").split("|")
+            if len(line) == 7 and line[0] == session:
+                bill_ids[line[1]] = line[3].strip()
+
+        for lsr, bill_id in bill_ids.items():
+            # CACRs can start in either chamber, so check the page
+            if chamber_map.get(bill_id[0], "legislature") not in (
+                chamber,
+                "legislature",
+            ):
+                continue
+            url, page = self.get_legacy_page(
+                f"bill_status.aspx?lsr={lsr}&sy={session}&sortoption=&txtsessionyear={session}"
+            )
+            body = page.xpath("//dt[text()='Body']/following-sibling::dd/text()")
+            title = page.xpath("string(//p[@class='bill-title']/em)").strip()
+            if not body or not title:
+                self.warning(f"No bill status for {bill_id} at {url}")
+                continue
+            if body[0] != body_code[chamber]:
+                continue
+
+            bill = self.bills[lsr] = self.bills_by_id[bill_id] = Bill(
+                legislative_session=session,
+                chamber=chamber,
+                identifier=bill_id,
+                title=title,
+                classification=extended_type_map[self.extract_until_number(bill_id)],
+            )
+            bill.extras["LSR"] = lsr
+            if page.xpath("//a[contains(@href, 'Billstatus_billrollcalls')]"):
+                self.lsrs_with_roll_calls.add(lsr)
+
+            # billinfo.aspx drops sponsors who have since left; this page keeps them
+            self.scrape_sponsors_from_legacy_page(bill, lsr, session, page)
+            version_id = self.scrape_versions_from_docket(bill, lsr, session)
+            if version_id:
+                self.add_source(bill, version_id)
+            else:
+                bill.add_source(url)
+
+    def scrape_votes_from_legacy_pages(self, session):
+        for lsr, bill in self.bills.items():
+            # most bills have no roll calls; the status page links the ones
+            # that do (the docket also tags committee votes "RC", and misses some)
+            if lsr not in self.lsrs_with_roll_calls:
+                continue
+            _, page = self.get_legacy_page(
+                f"Roll_calls/Billstatus_billrollcalls.aspx?lsr={lsr}&sy={session}&txtsessionyear={session}"
+            )
+            for row in page.xpath("//table//tr[td]"):
+                details = row.xpath(".//a[contains(@href, 'rcdetails')]/@href")[0]
+                date, vote_num, motion, yeas, nays = [
+                    " ".join(cell.text_content().split())
+                    for cell in row.xpath("./td")[1:6]
+                ]
+                yeas, nays = int(yeas.split()[0]), int(nays.split()[0])
+                body = re.search(r"lb=([HS])", details).group(1)
+                vote = Vote(
+                    chamber=chamber_map[body],
+                    identifier=vote_num,
+                    start_date=dt.datetime.strptime(date, "%m/%d/%Y").strftime(
+                        "%Y-%m-%d"
+                    ),
+                    motion_text=motion or "[not available]",
+                    result="pass" if yeas > nays else "fail",
+                    classification="passage",
+                    bill=bill,
+                )
+                vote.set_count("yes", yeas)
+                vote.set_count("no", nays)
+                vote.dedupe_key = session + body + vote_num
+
+                url, roll = self.get_legacy_page(f"Roll_calls/{details}")
+                vote.add_source(url)
+                others = Counter()
+                for member in roll.xpath("//table//tr[th[@scope='row']]"):
+                    last, _, first = member.xpath("string(th)").strip().partition(", ")
+                    option = member.xpath("string(td[last()])").strip()
+                    option = {"Yea": "yes", "Nay": "no"}.get(
+                        option, WEB_NON_VOTE_OPTIONS.get(option, "other")
+                    )
+                    vote.vote(option, " ".join(f"{first} {last}".split()))
+                    if option not in ("yes", "no"):
+                        others[option] += 1
+                for option, count in others.items():
+                    vote.set_count(option, count)
+                yield vote
+
     def scrape_votes(self, session):
         votes = {}
         other_counts = defaultdict(int)
         last_line = []
         vote_url = f"https://gc.nh.gov/dynamicdatadump/RollCallSummary.txt?x={self.cachebreaker}"
-        lines = self.get(vote_url, verify=False).content.decode("utf-8").splitlines()
+
+        # legislators.txt omits some members (current and past),
+        # so their roll call rows would be dropped. This page names every
+        # current and past member by the member id in RollCallHistory.txt.
+        member_names = {}
+        members_page = lxml.html.fromstring(
+            self.get(
+                "https://gc.nh.gov/bill_Status/byAnyMember.aspx", verify=False
+            ).content
+        )
+        for option in members_page.xpath(
+            "//select[@name='ctl00$pageBody$lstMembers']/option"
+        ):
+            match = re.match(r"(?:Rep|Sen)\. (.+?), (.+?)\(", option.text_content())
+            if match:
+                member_names[option.get("value")] = f"{match[2]} {match[1]}"
+        lines = self.get_dump("RollCallSummary.txt").splitlines()
 
         for line in lines:
-
             if len(line) < 2:
                 continue
 
@@ -690,8 +930,12 @@ class NHBillScraper(Scraper):
                 time = pytz.timezone("America/New_York").localize(time).isoformat()
                 # TODO: stop faking passed somehow
                 passed = yeas > nays
+                # Senate rows are dated at midnight; the roll call number is what
+                # tells two same-day roll calls on one motion apart. The last
+                # column is when the roll was recorded, not when it was taken.
                 vote = Vote(
                     chamber=actor,
+                    identifier=vote_num,
                     start_date=time,
                     motion_text=motion,
                     result="pass" if passed else "fail",
@@ -704,23 +948,23 @@ class NHBillScraper(Scraper):
                 vote.dedupe_key = session_yr + body + vote_num  # unique ID for vote
                 votes[body + vote_num] = vote
 
-        for line in (
-            self.get(
-                f"https://gc.nh.gov/dynamicdatadump/RollCallHistory.txt?x={self.cachebreaker}",
-                verify=False,
-            )
-            .content.decode("utf-8")
-            .splitlines()
-        ):
+        for line in self.get_dump("RollCallHistory.txt").splitlines():
             if len(line) < 2:
                 continue
 
             # 2016|H|2|330795||Yea|
             # 2012    | H   | 2    | 330795  | 964 |  HB309  | Yea | 1/4/2012 8:27:03 PM
             try:
-                session_yr, body, v_num, _, employee, bill_id, vote, date = line.split(
-                    "|"
-                )
+                (
+                    session_yr,
+                    body,
+                    v_num,
+                    member,
+                    employee,
+                    bill_id,
+                    vote,
+                    date,
+                ) = line.split("|")
             except ValueError:
                 # not enough keys in the split
                 self.warning(f"Skipping {line}, didn't have all needed data for vote")
@@ -729,9 +973,11 @@ class NHBillScraper(Scraper):
                 continue
 
             if session_yr == session and bill_id.strip() in self.bills_by_id:
-                try:
+                if employee in self.legislators:
                     leg = " ".join(self.legislators[employee]["name"].split())
-                except KeyError:
+                elif member in member_names:
+                    leg = " ".join(member_names[member].split())
+                else:
                     self.warning(f"Error, can't find person {employee}")
                     continue
 
@@ -747,10 +993,15 @@ class NHBillScraper(Scraper):
                 elif vote == "Nay":
                     votes[body + v_num].no(leg)
                 else:
-                    votes[body + v_num].vote("other", leg)
+                    # "Presiding" is the chair, who is present but doesn't vote;
+                    # keep it apart from the two kinds of absence
+                    option = NON_VOTE_OPTIONS.get(vote, "other")
+                    votes[body + v_num].vote(option, leg)
                     # hack-ish, but will keep the vote count sync'd
-                    other_counts[body + v_num] += 1
-                    votes[body + v_num].set_count("other", other_counts[body + v_num])
+                    other_counts[body + v_num, option] += 1
+                    votes[body + v_num].set_count(
+                        option, other_counts[body + v_num, option]
+                    )
         for vote in votes.values():
             yield vote
 

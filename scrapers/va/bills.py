@@ -21,7 +21,6 @@ class VaBillScraper(Scraper):
     base_url: str = "https://lis.virginia.gov"
     session_code: str = ""
     categorizer = Categorizer()
-    verify = False
 
     chamber_map = {
         "S": "upper",
@@ -71,7 +70,9 @@ class VaBillScraper(Scraper):
             verify=False,
         ).json()
 
-        bill_list = page["Legislations"]
+        # The list repeats a bill once per summary version (same LegislationID),
+        # which scraped it and its votes several times. Keep the latest row.
+        bill_list = list({r["LegislationID"]: r for r in page["Legislations"]}.values())
         # if scrape_chunk_number is specified, we are being asked to scrape
         # only a specific chunk of the total bills
         # let's use 1-based counting so we're not doing scrape_chunk_number=0
@@ -252,37 +253,31 @@ class VaBillScraper(Scraper):
                     on_duplicate="ignore",
                 )
 
-            # Some versions (commonly ones that never got a generated PDF,
-            # e.g. still-prefiled bills) have no PDFFile/HTMLFile at all --
-            # getlegislationtextbyidasync only returns their text inline as
-            # DraftText, which isn't a URL we can hand off. The old
-            # legacylis.virginia.gov site still serves a rendered HTML page
-            # of that same text, so fall back to it rather than dropping
-            # the version entirely.
-            if not row["PDFFile"] and not row["HTMLFile"] and row.get("DraftText"):
-                legacy_url = (
-                    "https://legacylis.virginia.gov/cgi-bin/legp604.exe?"
-                    f"{self.session_code[2:]}+ful+{bill.identifier}"
-                )
-                bill.add_version_link(
-                    row["Description"],
-                    legacy_url,
-                    media_type="text/html",
-                    on_duplicate="ignore",
-                )
-
             if row["ImpactFile"]:
                 for impact in row["ImpactFile"]:
                     # map 241HB9F122 => HB9F122
-                    # however somtimes ReferenceNumber does NOT have a weird prefix
-                    if impact["ReferenceNumber"][3:] in self.ref_num_map:
-                        action = self.ref_num_map[impact["ReferenceNumber"][3:]]
-                    elif impact["ReferenceNumber"] in self.ref_num_map:
-                        action = self.ref_num_map[impact["ReferenceNumber"]]
+                    # however sometimes ReferenceNumber does NOT have a weird prefix
+                    ref = impact["ReferenceNumber"]
+                    if ref[3:] in self.ref_num_map:
+                        action = self.ref_num_map[ref[3:]]
+                    elif ref in self.ref_num_map:
+                        action = self.ref_num_map[ref]
                     else:
-                        action = "Unknown"
+                        action = "Fiscal Impact Statement"
+
+                    # Avoid double-prefixing if the action description already starts with
+                    # "Fiscal Impact Statement"
+                    if not action.lower().startswith("fiscal impact statement"):
+                        action = "Fiscal Impact Statement: " + action
+                    # one statement per version, all sharing the same event text
+                    action = f"{action} - {row['Description']}"
+
                     bill.add_document_link(
-                        action, impact["FileURL"], media_type="application/pdf"
+                        action,
+                        impact["FileURL"],
+                        media_type="application/pdf",
+                        classification="fiscal-note",
+                        on_duplicate="ignore",
                     )
 
     def add_votes(self, bill: Bill, legislation_id: str):
@@ -305,6 +300,7 @@ class VaBillScraper(Scraper):
         page = json.loads(page)
 
         vote_ids_processed = set()
+        votes_processed = set()
         for row in page["Votes"]:
             if row["VoteID"] in vote_ids_processed:
                 # there tends to be lots of duplicates of votes in this page["Votes"] list, no idea why
@@ -313,7 +309,21 @@ class VaBillScraper(Scraper):
                 vote_date = dateutil.parser.parse(row["VoteDate"]).date()
 
                 # Our historical votes have mostly used the bill action descrioption, so we stick with this
-                motion_text = row["LegislationActionDescription"]
+                bill_action = row["LegislationActionDescription"]
+                if bill_action is None:
+                    # The top-level field is null on current LIS data; the bill's
+                    # action text lives on its VoteLegislation entry instead
+                    bill_action = next(
+                        (
+                            vl["LegislationActionDescription"]
+                            for vl in row.get("VoteLegislation") or []
+                            if vl["LegislationNumber"]
+                            == bill.identifier.replace(" ", "")
+                            and vl["LegislationActionDescription"]
+                        ),
+                        None,
+                    )
+                motion_text = bill_action
                 if motion_text is None and row["VoteActionDescription"]:
                     # VoteActionDescription doesn't seem as user friendly, when looking at the text values.
                     # A lot of "H Vote:" values
@@ -330,10 +340,28 @@ class VaBillScraper(Scraper):
                     "%NextSessionYear%", str(vote_date.year + 1)
                 )
 
+                # LIS sometimes records the same committee vote twice under two
+                # VoteIDs (same time, description and roll), so skip the repeat
+                vote_key = (
+                    row["VoteDate"],
+                    row["ChamberCode"],
+                    row["CommitteeName"],
+                    row["Description"],
+                    motion_text,
+                    frozenset(
+                        (m["MemberDisplayName"], m.get("ResponseCode"))
+                        for m in row["VoteMember"]
+                    ),
+                )
+                if vote_key in votes_processed:
+                    self.info(f"Skipping duplicate vote {row['VoteID']} for {bill}")
+                    continue
+                votes_processed.add(vote_key)
+
                 v = VoteEvent(
                     start_date=vote_date,
                     motion_text=motion_text,
-                    bill_action=row["LegislationActionDescription"],
+                    bill_action=bill_action,
                     result="fail",  # placeholder for now
                     chamber=self.chamber_map[row["ChamberCode"]],
                     bill=bill,
@@ -380,7 +408,10 @@ class VaBillScraper(Scraper):
                     # some voice votes are miscoded so don't contain data
                     continue
 
-                if tally["Y"] > tally["N"]:
+                # PassFail reflects tie-breaks and supermajority thresholds
+                if row["PassFail"] in ("P", "F"):
+                    v.result = "pass" if row["PassFail"] == "P" else "fail"
+                elif tally["Y"] > tally["N"]:
                     v.result = "pass"
                 else:
                     v.result = "fail"
@@ -405,12 +436,12 @@ class VaBillScraper(Scraper):
                 self.info(f"Skipping vote {row['BatchNumber']} with no pass fail")
 
     def classify_bill(self, row: dict):
-        btype = "bill"
-
         if "constitutional amendment" in row["Description"].lower():
-            btype = "constitutional amendment"
-
-        return btype
+            return "constitutional amendment"
+        # HB/SB, HJ/SJ, HR/SR
+        return {"J": "joint resolution", "R": "resolution"}.get(
+            row["LegislationNumber"][1], "bill"
+        )
 
     def text_from_html(self, html: str):
         return lxml.html.fromstring(html).text_content()

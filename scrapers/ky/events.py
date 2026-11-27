@@ -14,9 +14,9 @@ class KYEventScraper(Scraper):
     _tz = pytz.timezone("US/Eastern")
 
     def scrape(self):
-        self.headers[
-            "User-Agent"
-        ] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/93.0.4577.82 Safari/537.36"
+        self.headers["User-Agent"] = (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/93.0.4577.82 Safari/537.36"
+        )
         url = "https://apps.legislature.ky.gov/legislativecalendar"
 
         page = self.get(url, verify=False).content
@@ -47,9 +47,10 @@ class KYEventScraper(Scraper):
             row_text = re.sub(
                 r"Upon (Recess|Adj\.)\s*(of)?\s*(the)?\s*(House|Senate)?", "", row_text
             )
-            parts = re.split(r",|AM|PM", row_text)
-            time = parts[0].strip()
-            location = " ".join(x.replace(r"\xa0", "").strip() for x in parts[1:])
+            # e.g. "9:00 am ET / 8:00 am CT, Annex Room 154"; take the first (Eastern) time
+            time = re.search(r"\d{1,2}:\d{2}\s*[ap]m", row_text, flags=re.I)
+            time = time.group() if time else ""
+            location = row_text.partition(",")[2].strip()
 
             when = f"{date} {time}"
             try:

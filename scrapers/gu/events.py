@@ -3,7 +3,6 @@ from ics import Calendar
 import datetime
 import pytz
 import re
-import requests
 
 
 class GUEventScraper(Scraper):
@@ -20,11 +19,10 @@ class GUEventScraper(Scraper):
 
         ical_url = "https://calendar.google.com/calendar/ical/webmaster%40guamlegislature.com/public/basic.ics"
 
-        ical = requests.get(ical_url).text
+        ical = self.get(ical_url).text
         self.info("Parsing event feed. This may take a moment.")
         cal = Calendar(ical)
         for e in cal.events:
-
             if parse_older is None and e.begin < jan_first:
                 self.info(f"Skipping event from {str(e.begin)}")
                 continue
